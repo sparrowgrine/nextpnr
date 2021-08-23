@@ -2731,6 +2731,38 @@ class Ecp5Packer
             }
         }
         flush_cells();
+        // Constrain DLLDELs
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type == id_DLLDELD) {
+                NetInfo *a = get_net_or_empty(ci, id_A);
+                if (a == nullptr || a->driver.cell == nullptr)
+                    log_error("Found DLLDELD '%s' with disconnected A input\n", ctx->nameOf(ci));
+                CellInfo *io = a->driver.cell;
+                if (io->type != id_TRELLIS_IO)
+                    log_error("Found DLLDELD '%s' with A input driven by non-IO cell '%s'\n", ctx->nameOf(ci), ctx->nameOf(io));
+                if (!io->attrs.count(ctx->id("BEL")))
+                    log_error("Found DLLDELD '%s' with disconnected A input\n", ctx->nameOf(ci));
+                BelId io_bel = ctx->getBelByNameStr(io->attrs.at(ctx->id("BEL")).as_string());
+                for (PipId pip : ctx->getPipsDownhill(ctx->getWireBelPin(io_bel, id_PADDI))) {
+                    for (BelPin belpin : ctx->getWireBelPins(pip)) {
+                        if (ctx->getBelType(belpin.bel) != id_DLLDELD)
+                            continue;
+                        std::string dll_bel = ctx->getBelName(belpin.bel).str(ctx);
+                        log_info("Constraining DLLDELD '%s' to bel '%s'\n", ctx->nameOf(ci), dll_bel.c_str());
+                        ci->attrs[ctx->id("BEL")] = dll_bel;
+                        goto dlldel_done;
+                    }
+                }
+
+                if (0) {
+dlldel_done:
+                    continue;
+                }
+                log_error("Failed to constrain DLLDELD '%s', is the 'A' input connected to a dedicated clock input pin?\n",
+                    ctx->nameOf(ci));
+            }
+        }
         // Constrain ECLK-related cells
         for (auto &cell : ctx->cells) {
             CellInfo *ci = cell.second.get();
@@ -2889,7 +2921,7 @@ class Ecp5Packer
                 if (ddrdel != nullptr) {
                     for (auto &usr : ddrdel->users) {
                         const CellInfo *uc = usr.cell;
-                        if (uc->type != id_DQSBUFM || !uc->attrs.count(ctx->id("BEL")))
+                        if ((uc->type != id_DQSBUFM && uc->type != id_DLLDELD) || !uc->attrs.count(ctx->id("BEL")))
                             continue;
                         BelId dqsb_bel = ctx->getBelByNameStr(uc->attrs.at(ctx->id("BEL")).as_string());
                         Loc dqsb_loc = ctx->getBelLocation(dqsb_bel);
@@ -2903,34 +2935,36 @@ class Ecp5Packer
                 if (left_bank_users && right_bank_users)
                     log_error("DDRDLLA '%s' has DDRDEL uses on both sides of the chip.\n", ctx->nameOf(ci));
 
+                std::set<int> eclk_banks;
                 for (auto &eclk : eclks) {
-                    if (eclk.second.unbuf == clk) {
-                        for (auto bel : ctx->getBels()) {
-                            if (ctx->getBelType(bel) != id_DDRDLL)
-                                continue;
-                            Loc loc = ctx->getBelLocation(bel);
-                            if (loc.x > 15 && left_bank_users)
-                                continue;
-                            if (loc.x < 15 && right_bank_users)
-                                continue;
-                            int ddrdll_bank = -1;
-                            if (loc.x < 15 && loc.y < 15)
-                                ddrdll_bank = 7;
-                            else if (loc.x < 15 && loc.y > 15)
-                                ddrdll_bank = 6;
-                            else if (loc.x > 15 && loc.y < 15)
-                                ddrdll_bank = 2;
-                            else if (loc.x > 15 && loc.y > 15)
-                                ddrdll_bank = 3;
-                            if (eclk.first.first != ddrdll_bank)
-                                continue;
-                            log_info("Constraining DDRDLLA '%s' to bel '%s'\n", ctx->nameOf(ci), ctx->nameOfBel(bel));
-                            ci->attrs[ctx->id("BEL")] = ctx->getBelName(bel).str(ctx);
-                            make_eclk(ci->ports.at(id_CLK), ci, bel, eclk.first.first);
-                            goto ddrdll_done;
-                        }
-                    }
+                    if (eclk.second.unbuf == clk)
+                        eclk_banks.insert(eclk.first.first);
                 }
+                for (auto bel : ctx->getBels()) {
+                    if (ctx->getBelType(bel) != id_DDRDLL)
+                        continue;
+                    Loc loc = ctx->getBelLocation(bel);
+                    if (loc.x > 15 && left_bank_users)
+                        continue;
+                    if (loc.x < 15 && right_bank_users)
+                        continue;
+                    int ddrdll_bank = -1;
+                    if (loc.x < 15 && loc.y < 15)
+                        ddrdll_bank = 7;
+                    else if (loc.x < 15 && loc.y > 15)
+                        ddrdll_bank = 6;
+                    else if (loc.x > 15 && loc.y < 15)
+                        ddrdll_bank = 2;
+                    else if (loc.x > 15 && loc.y > 15)
+                        ddrdll_bank = 3;
+                    if (!eclk_banks.empty() && !eclk_banks.count(ddrdll_bank))
+                        continue;
+                    log_info("Constraining DDRDLLA '%s' to bel '%s'\n", ctx->nameOf(ci), ctx->nameOfBel(bel));
+                    ci->attrs[ctx->id("BEL")] = ctx->getBelName(bel).str(ctx);
+                    make_eclk(ci->ports.at(id_CLK), ci, bel, ddrdll_bank);
+                    goto ddrdll_done;
+                }
+
             ddrdll_done:
                 continue;
             }
